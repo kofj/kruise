@@ -17,40 +17,19 @@ limitations under the License.
 package imageruntime
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"time"
 
-	dockermessage "github.com/docker/docker/pkg/jsonmessage"
+	"google.golang.org/grpc"
+	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
+	"k8s.io/klog/v2"
+
 	daemonutil "github.com/openkruise/kruise/pkg/daemon/util"
 	"github.com/openkruise/kruise/pkg/util"
-	v1 "k8s.io/api/core/v1"
-	"k8s.io/klog/v2"
-	"k8s.io/kubernetes/pkg/credentialprovider"
-	credentialprovidersecrets "k8s.io/kubernetes/pkg/credentialprovider/secrets"
 )
-
-var (
-	keyring = credentialprovider.NewDockerKeyring()
-)
-
-func convertToRegistryAuths(pullSecrets []v1.Secret, repo string) (infos []daemonutil.AuthInfo, err error) {
-	keyring, err := credentialprovidersecrets.MakeDockerKeyring(pullSecrets, keyring)
-	if err != nil {
-		return nil, err
-	}
-	creds, withCredentials := keyring.Lookup(repo)
-	if !withCredentials {
-		return nil, nil
-	}
-	for _, c := range creds {
-		infos = append(infos, daemonutil.AuthInfo{
-			Username: c.Username,
-			Password: c.Password,
-		})
-	}
-	return infos, nil
-}
 
 // // Auths struct contains an embedded RegistriesStruct of name auths
 // type Auths struct {
@@ -111,8 +90,40 @@ func convertToRegistryAuths(pullSecrets []v1.Secret, repo string) (infos []daemo
 // }
 
 type layerProgress struct {
-	*dockermessage.JSONProgress
+	*JSONProgress
 	Status string `json:"status,omitempty"` // Extracting,Pull complete,Pulling fs layer,Verifying Checksum,Downloading
+}
+
+type JSONProgress struct {
+	// Current is the current status and value of the progress made towards Total.
+	Current int64 `json:"current,omitempty"`
+	// Total is the end value describing when we made 100% progress for an operation.
+	Total int64 `json:"total,omitempty"`
+	// Start is the initial value for the operation.
+	Start int64 `json:"start,omitempty"`
+	// HideCounts. if true, hides the progress count indicator (xB/yB).
+	HideCounts bool `json:"hidecounts,omitempty"`
+	// Units is the unit to print for progress. It defaults to "bytes" if empty.
+	Units string `json:"units,omitempty"`
+}
+
+type JSONMessage struct {
+	Stream   string        `json:"stream,omitempty"`
+	Status   string        `json:"status,omitempty"`
+	ID       string        `json:"id,omitempty"`
+	Progress *JSONProgress `json:"progressDetail,omitempty"`
+	Error    *JSONError    `json:"errorDetail,omitempty"`
+}
+
+// JSONError wraps a concrete Code and Message, Code is
+// an integer error code, Message is the error message.
+type JSONError struct {
+	Code    int    `json:"code,omitempty"`
+	Message string `json:"message,omitempty"`
+}
+
+func (e *JSONError) Error() string {
+	return e.Message
 }
 
 type pullingProgress struct {
@@ -194,7 +205,7 @@ func (r *imagePullStatusReader) mainloop() {
 		case <-r.done:
 			return
 		default:
-			var jm dockermessage.JSONMessage
+			var jm JSONMessage
 			err := decoder.Decode(&jm)
 			if err == io.EOF {
 				klog.V(5).Info("runtime read eof")
@@ -202,17 +213,17 @@ func (r *imagePullStatusReader) mainloop() {
 				return
 			}
 			if err != nil {
-				klog.V(5).Infof("runtime read err %v", err)
+				klog.V(5).ErrorS(err, "runtime read err")
 				r.seedPullStatus(ImagePullStatus{Err: err, Finish: true})
 				return
 			}
 			if jm.Error != nil {
-				klog.V(5).Infof("runtime read err %v", jm.Error)
+				klog.V(5).ErrorS(jm.Error, "runtime read err")
 				r.seedPullStatus(ImagePullStatus{Err: fmt.Errorf("get error in pull response: %+v", jm.Error), Finish: true})
 				return
 			}
 
-			klog.V(5).Infof("runtime read progress %v", util.DumpJSON(jm))
+			klog.V(5).InfoS("runtime read progress", "message", util.DumpJSON(jm))
 			if jm.ID != "" {
 				progress.Layers[jm.ID] = layerProgress{
 					JSONProgress: jm.Progress,
@@ -238,4 +249,22 @@ func (c ImageInfo) ContainsImage(name string, tag string) bool {
 		}
 	}
 	return false
+}
+
+func determineImageClientAPIVersion(conn *grpc.ClientConn) (runtimeapi.ImageServiceClient, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	klog.V(4).InfoS("Finding the CRI API image version")
+	imageClientV1 := runtimeapi.NewImageServiceClient(conn)
+
+	//"CRI v1alpha2 image API (deprecated in k8s 1.24)"
+	_, err := imageClientV1.ImageFsInfo(ctx, &runtimeapi.ImageFsInfoRequest{})
+	if err == nil {
+		klog.V(2).InfoS("Using CRI v1 image API")
+		return imageClientV1, nil
+
+	}
+
+	return nil, fmt.Errorf("unable to determine image API version: %w", err)
 }

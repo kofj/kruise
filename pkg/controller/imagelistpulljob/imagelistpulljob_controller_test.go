@@ -21,17 +21,20 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/clock"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/utils/clock"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	appsv1alpha1 "github.com/openkruise/kruise/apis/apps/v1alpha1"
+	"github.com/openkruise/kruise/pkg/util/fieldindex"
 )
 
 var testscheme *k8sruntime.Scheme
@@ -43,8 +46,8 @@ var (
 
 func init() {
 	testscheme = k8sruntime.NewScheme()
-	_ = corev1.AddToScheme(testscheme)
-	_ = appsv1alpha1.AddToScheme(testscheme)
+	utilruntime.Must(corev1.AddToScheme(testscheme))
+	utilruntime.Must(appsv1alpha1.AddToScheme(testscheme))
 }
 
 func TestReconcile(t *testing.T) {
@@ -410,7 +413,10 @@ func TestComputeImagePullJobActions(t *testing.T) {
 	reconcileJob := ReconcileImageListPullJob{}
 	for _, cs := range cases {
 		t.Run(cs.name, func(t *testing.T) {
-			needToCreateImagePullJobs, needToDeleteImagePullJobs := reconcileJob.computeImagePullJobActions(cs.ImageListPullJob, cs.ImagePullJobs)
+			needToCreateImagePullJobs, needToDeleteImagePullJobs := reconcileJob.computeImagePullJobActions(cs.ImageListPullJob, cs.ImagePullJobs, "v1")
+			for _, job := range cs.needToCreateImagePullJobs {
+				job.Labels[appsv1.ControllerRevisionHashLabelKey] = "v1"
+			}
 			assert.Equal(t, cs.needToCreateImagePullJobs, needToCreateImagePullJobs)
 			assert.Equal(t, cs.needToDeleteImagePullJobs, needToDeleteImagePullJobs)
 		})
@@ -418,7 +424,14 @@ func TestComputeImagePullJobActions(t *testing.T) {
 }
 
 func createReconcileJob(scheme *k8sruntime.Scheme, initObjs ...client.Object) ReconcileImageListPullJob {
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(initObjs...).Build()
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(initObjs...).
+		WithIndex(&appsv1alpha1.ImagePullJob{}, fieldindex.IndexNameForOwnerRefUID, func(obj client.Object) []string {
+			var owners []string
+			for _, ref := range obj.GetOwnerReferences() {
+				owners = append(owners, string(ref.UID))
+			}
+			return owners
+		}).WithStatusSubresource(&appsv1alpha1.ImageListPullJob{}).Build()
 	eventBroadcaster := record.NewBroadcaster()
 	recorder := eventBroadcaster.NewRecorder(scheme, corev1.EventSource{Component: "imagelistpulljob-controller"})
 	reconcileJob := ReconcileImageListPullJob{

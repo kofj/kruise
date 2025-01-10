@@ -4,6 +4,8 @@ import (
 	"context"
 	"testing"
 
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+
 	appsv1alpha1 "github.com/openkruise/kruise/apis/apps/v1alpha1"
 	"github.com/openkruise/kruise/pkg/control/sidecarcontrol"
 
@@ -130,11 +132,11 @@ var (
 
 func init() {
 	scheme = runtime.NewScheme()
-	_ = clientgoscheme.AddToScheme(scheme)
-	_ = appsv1alpha1.AddToScheme(clientgoscheme.Scheme)
-	_ = appsv1.AddToScheme(scheme)
-	_ = appsv1alpha1.AddToScheme(scheme)
-	_ = corev1.AddToScheme(scheme)
+	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
+	utilruntime.Must(appsv1alpha1.AddToScheme(clientgoscheme.Scheme))
+	utilruntime.Must(appsv1.AddToScheme(scheme))
+	utilruntime.Must(appsv1alpha1.AddToScheme(scheme))
+	utilruntime.Must(corev1.AddToScheme(scheme))
 }
 
 func getLatestPod(client client.Client, pod *corev1.Pod) (*corev1.Pod, error) {
@@ -180,7 +182,9 @@ func testUpdateWhenUseNotUpdateStrategy(t *testing.T, sidecarSetInput *appsv1alp
 		},
 	}
 
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(sidecarSetInput, podInput).Build()
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(sidecarSetInput, podInput).
+		WithStatusSubresource(&appsv1alpha1.SidecarSet{}).Build()
 	reconciler := ReconcileSidecarSet{
 		Client:    fakeClient,
 		processor: NewSidecarSetProcessor(fakeClient, record.NewFakeRecorder(10)),
@@ -213,7 +217,9 @@ func testUpdateWhenSidecarSetPaused(t *testing.T, sidecarSetInput *appsv1alpha1.
 		},
 	}
 
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(sidecarSetInput, podInput).Build()
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(sidecarSetInput, podInput).
+		WithStatusSubresource(&appsv1alpha1.SidecarSet{}).Build()
 	reconciler := ReconcileSidecarSet{
 		Client:    fakeClient,
 		processor: NewSidecarSetProcessor(fakeClient, record.NewFakeRecorder(10)),
@@ -246,7 +252,9 @@ func testUpdateWhenMaxUnavailableNotZero(t *testing.T, sidecarSetInput *appsv1al
 		},
 	}
 
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(sidecarSetInput, podInput).Build()
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(sidecarSetInput, podInput).
+		WithStatusSubresource(&appsv1alpha1.SidecarSet{}).Build()
 	reconciler := ReconcileSidecarSet{
 		Client:    fakeClient,
 		processor: NewSidecarSetProcessor(fakeClient, record.NewFakeRecorder(10)),
@@ -280,7 +288,8 @@ func testUpdateWhenPartitionFinished(t *testing.T, sidecarSetInput *appsv1alpha1
 		},
 	}
 
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(sidecarSetInput, podInput).Build()
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(sidecarSetInput, podInput).
+		WithStatusSubresource(&appsv1alpha1.SidecarSet{}).Build()
 	reconciler := ReconcileSidecarSet{
 		Client:    fakeClient,
 		processor: NewSidecarSetProcessor(fakeClient, record.NewFakeRecorder(10)),
@@ -314,7 +323,8 @@ func testRemoveSidecarSet(t *testing.T, sidecarSetInput *appsv1alpha1.SidecarSet
 		},
 	}
 
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(sidecarSetInput, podInput).Build()
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(sidecarSetInput, podInput).
+		WithStatusSubresource(&appsv1alpha1.SidecarSet{}).Build()
 	reconciler := ReconcileSidecarSet{
 		Client:    fakeClient,
 		processor: NewSidecarSetProcessor(fakeClient, record.NewFakeRecorder(10)),
