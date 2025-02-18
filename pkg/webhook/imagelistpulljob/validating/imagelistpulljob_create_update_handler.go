@@ -35,7 +35,7 @@ import (
 // ImageListPullJobCreateUpdateHandler handles ImagePullJob
 type ImageListPullJobCreateUpdateHandler struct {
 	// Decoder decodes objects
-	Decoder *admission.Decoder
+	Decoder admission.Decoder
 }
 
 var _ admission.Handler = &ImageListPullJobCreateUpdateHandler{}
@@ -51,9 +51,12 @@ func (h *ImageListPullJobCreateUpdateHandler) Handle(ctx context.Context, req ad
 	if !utilfeature.DefaultFeatureGate.Enabled(features.KruiseDaemon) {
 		return admission.Errored(http.StatusForbidden, fmt.Errorf("feature-gate %s is not enabled", features.KruiseDaemon))
 	}
+	if !utilfeature.DefaultFeatureGate.Enabled(features.ImagePullJobGate) {
+		return admission.Errored(http.StatusForbidden, fmt.Errorf("feature-gate %s is not enabled", features.ImagePullJobGate))
+	}
 
 	if err := validate(obj); err != nil {
-		klog.Warningf("Error validate ImageListPullJob %s/%s: %v", obj.Namespace, obj.Name, err)
+		klog.ErrorS(err, "Error validate ImageListPullJob", "namespace", obj.Namespace, "name", obj.Name)
 		return admission.Errored(http.StatusBadRequest, err)
 	}
 
@@ -119,13 +122,5 @@ func validate(obj *appsv1alpha1.ImageListPullJob) error {
 		return fmt.Errorf("unknown type of completionPolicy: %s", obj.Spec.CompletionPolicy.Type)
 	}
 
-	return nil
-}
-
-var _ admission.DecoderInjector = &ImageListPullJobCreateUpdateHandler{}
-
-// InjectDecoder injects the decoder into the ImageListPullJobCreateUpdateHandler
-func (h *ImageListPullJobCreateUpdateHandler) InjectDecoder(d *admission.Decoder) error {
-	h.Decoder = d
 	return nil
 }

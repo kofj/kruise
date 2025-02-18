@@ -19,28 +19,31 @@ package imagelistpulljob
 import (
 	"context"
 	"fmt"
+	"hash/fnv"
+	"reflect"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/clock"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/apimachinery/pkg/util/rand"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/retry"
 	"k8s.io/klog/v2"
+	hashutil "k8s.io/kubernetes/pkg/util/hash"
 	"k8s.io/kubernetes/pkg/util/slice"
+	"k8s.io/utils/clock"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
-
-	"reflect"
 
 	appsv1alpha1 "github.com/openkruise/kruise/apis/apps/v1alpha1"
 	"github.com/openkruise/kruise/pkg/features"
@@ -64,7 +67,8 @@ var (
 // Add creates a new ImageListPullJob Controller and adds it to the Manager with default RBAC. The Manager will set fields on the Controller
 // and Start it when the Manager is Started.
 func Add(mgr manager.Manager) error {
-	if !utildiscovery.DiscoverGVK(controllerKind) || !utilfeature.DefaultFeatureGate.Enabled(features.KruiseDaemon) {
+	if !utildiscovery.DiscoverGVK(controllerKind) || !utilfeature.DefaultFeatureGate.Enabled(features.KruiseDaemon) ||
+		!utilfeature.DefaultFeatureGate.Enabled(features.ImagePullJobGate) {
 		return nil
 	}
 	return add(mgr, newReconciler(mgr))
@@ -90,18 +94,17 @@ func add(mgr manager.Manager, r *ReconcileImageListPullJob) error {
 	}
 
 	// Watch for changes to ImageListPullJob
-	err = c.Watch(&source.Kind{Type: &appsv1alpha1.ImageListPullJob{}}, &handler.EnqueueRequestForObject{})
+	err = c.Watch(source.Kind(mgr.GetCache(), &appsv1alpha1.ImageListPullJob{}, &handler.TypedEnqueueRequestForObject[*appsv1alpha1.ImageListPullJob]{}))
 	if err != nil {
 		return err
 	}
 	// Watch for changes to ImagePullJob
 	// todo the imagelistpulljob(status) will not change if  the pull job status does not change significantly (ex. number of failed nodeimage changes from 1 to 2)
-	err = c.Watch(&source.Kind{Type: &appsv1alpha1.ImagePullJob{}}, &imagePullJobEventHandler{
-		enqueueHandler: handler.EnqueueRequestForOwner{
-			IsController: true,
-			OwnerType:    &appsv1alpha1.ImageListPullJob{},
-		},
-	})
+	err = c.Watch(source.Kind(mgr.GetCache(), &appsv1alpha1.ImagePullJob{},
+		&imagePullJobEventHandler{
+			enqueueHandler: handler.TypedEnqueueRequestForOwner[*appsv1alpha1.ImagePullJob](mgr.GetScheme(), mgr.GetRESTMapper(),
+				&appsv1alpha1.ImageListPullJob{}, handler.OnlyControllerOwner()),
+		}))
 	if err != nil {
 		return err
 	}
@@ -126,7 +129,7 @@ type ReconcileImageListPullJob struct {
 // and what is in the ImageListPullJob.Spec
 // Automatically generate RBAC rules to allow the Controller to read and write ImageListPullJob
 func (r *ReconcileImageListPullJob) Reconcile(_ context.Context, request reconcile.Request) (res reconcile.Result, err error) {
-	klog.V(5).Infof("Starting to process ImageListPullJob %v", request.NamespacedName)
+	klog.V(5).InfoS("Starting to process ImageListPullJob", "imageListPullJob", request)
 
 	// 1.Fetch the ImageListPullJob instance
 	job := &appsv1alpha1.ImageListPullJob{}
@@ -140,13 +143,18 @@ func (r *ReconcileImageListPullJob) Reconcile(_ context.Context, request reconci
 		return reconcile.Result{}, err
 	}
 
+	hash, err := r.refreshJobTemplateHash(job)
+	if err != nil {
+		return reconcile.Result{}, fmt.Errorf("refresh job template hash error: %v", err)
+	}
+
 	// The Job has been finished
 	if job.Status.CompletionTime != nil {
 		var leftTime time.Duration
 		if job.Spec.CompletionPolicy.TTLSecondsAfterFinished != nil {
 			leftTime = time.Duration(*job.Spec.CompletionPolicy.TTLSecondsAfterFinished)*time.Second - time.Since(job.Status.CompletionTime.Time)
 			if leftTime <= 0 {
-				klog.Infof("Deleting ImageListPullJob %s/%s for ttlSecondsAfterFinished", job.Namespace, job.Name)
+				klog.InfoS("Deleting ImageListPullJob for ttlSecondsAfterFinished", "imageListPullJob", klog.KObj(job))
 				if err = r.Delete(context.TODO(), job); err != nil {
 					return reconcile.Result{}, fmt.Errorf("delete ImageListPullJob error: %v", err)
 				}
@@ -158,10 +166,10 @@ func (r *ReconcileImageListPullJob) Reconcile(_ context.Context, request reconci
 
 	if scaleSatisfied, unsatisfiedDuration, scaleDirtyImagePullJobs := scaleExpectations.SatisfiedExpectations(request.String()); !scaleSatisfied {
 		if unsatisfiedDuration >= expectations.ExpectationTimeout {
-			klog.Warningf("Expectation unsatisfied overtime for ImageListPullJob %v, scaleDirtyImagePullJobs=%v, overtime=%v", request.String(), scaleDirtyImagePullJobs, unsatisfiedDuration)
+			klog.InfoS("Expectation unsatisfied overtime for ImageListPullJob", "imageListPullJob", request, "scaleDirtyImagePullJobs", scaleDirtyImagePullJobs, "overtime", unsatisfiedDuration)
 			return reconcile.Result{}, nil
 		}
-		klog.V(4).Infof("Not satisfied scale for ImageListPullJob %v, scaleDirtyImagePullJobs=%v", request.String(), scaleDirtyImagePullJobs)
+		klog.V(4).InfoS("Not satisfied scale for ImageListPullJob", "imageListPullJob", request, "scaleDirtyImagePullJobs", scaleDirtyImagePullJobs)
 		return reconcile.Result{RequeueAfter: expectations.ExpectationTimeout - unsatisfiedDuration}, nil
 	}
 
@@ -176,10 +184,10 @@ func (r *ReconcileImageListPullJob) Reconcile(_ context.Context, request reconci
 		resourceVersionExpectations.Observe(imagePullJob)
 		if isSatisfied, unsatisfiedDuration := resourceVersionExpectations.IsSatisfied(imagePullJob); !isSatisfied {
 			if unsatisfiedDuration >= expectations.ExpectationTimeout {
-				klog.Warningf("Expectation unsatisfied overtime for %v, timeout=%v", request.String(), unsatisfiedDuration)
+				klog.InfoS("Expectation unsatisfied overtime for ImageListPullJob", "imageListPullJob", request, "timeout", unsatisfiedDuration)
 				return reconcile.Result{}, nil
 			}
-			klog.V(4).Infof("Not satisfied resourceVersion for %v", request.String())
+			klog.V(4).InfoS("Not satisfied resourceVersion for ImageListPullJob", "imageListPullJob", request)
 			return reconcile.Result{RequeueAfter: expectations.ExpectationTimeout - unsatisfiedDuration}, nil
 		}
 	}
@@ -188,7 +196,7 @@ func (r *ReconcileImageListPullJob) Reconcile(_ context.Context, request reconci
 	newStatus := r.calculateStatus(job, imagePullJobsMap)
 
 	// 4. Compute ImagePullJobActions
-	needToCreate, needToDelete := r.computeImagePullJobActions(job, imagePullJobsMap)
+	needToCreate, needToDelete := r.computeImagePullJobActions(job, imagePullJobsMap, hash)
 
 	// 5. Sync ImagePullJob
 	err = r.syncImagePullJob(job, needToCreate, needToDelete)
@@ -206,6 +214,25 @@ func (r *ReconcileImageListPullJob) Reconcile(_ context.Context, request reconci
 	return reconcile.Result{}, nil
 }
 
+func (r *ReconcileImageListPullJob) refreshJobTemplateHash(job *appsv1alpha1.ImageListPullJob) (string, error) {
+	newHash := func(job *appsv1alpha1.ImageListPullJob) string {
+		jobTemplateHasher := fnv.New32a()
+		hashutil.DeepHashObject(jobTemplateHasher, job.Spec.ImagePullJobTemplate)
+		return rand.SafeEncodeString(fmt.Sprint(jobTemplateHasher.Sum32()))
+	}(job)
+
+	oldHash := job.Labels[appsv1.ControllerRevisionHashLabelKey]
+	if newHash == oldHash {
+		return newHash, nil
+	}
+
+	emptyJob := &appsv1alpha1.ImageListPullJob{}
+	emptyJob.SetName(job.Name)
+	emptyJob.SetNamespace(job.Namespace)
+	body := fmt.Sprintf(`{"metadata":{"labels":{"%s":"%s"}}}`, appsv1.ControllerRevisionHashLabelKey, newHash)
+	return newHash, r.Patch(context.TODO(), emptyJob, client.RawPatch(types.MergePatchType, []byte(body)))
+}
+
 func (r *ReconcileImageListPullJob) updateStatus(job *appsv1alpha1.ImageListPullJob, newStatus *appsv1alpha1.ImageListPullJobStatus) error {
 	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
 		imageListPullJob := &appsv1alpha1.ImageListPullJob{}
@@ -217,11 +244,11 @@ func (r *ReconcileImageListPullJob) updateStatus(job *appsv1alpha1.ImageListPull
 	})
 }
 
-func (r *ReconcileImageListPullJob) computeImagePullJobActions(job *appsv1alpha1.ImageListPullJob, imagePullJobs map[string]*appsv1alpha1.ImagePullJob) ([]*appsv1alpha1.ImagePullJob, []*appsv1alpha1.ImagePullJob) {
+func (r *ReconcileImageListPullJob) computeImagePullJobActions(job *appsv1alpha1.ImageListPullJob, imagePullJobs map[string]*appsv1alpha1.ImagePullJob, hash string) ([]*appsv1alpha1.ImagePullJob, []*appsv1alpha1.ImagePullJob) {
 	var needToDelete, needToCreate []*appsv1alpha1.ImagePullJob
 	//1. need to create
-	images, needToDelete := r.filterImagesAndImagePullJobs(job, imagePullJobs)
-	needToCreate = r.newImagePullJobs(job, images)
+	images, needToDelete := r.filterImagesAndImagePullJobs(job, imagePullJobs, hash)
+	needToCreate = r.newImagePullJobs(job, images, hash)
 	// some images delete from ImageListPullJob.Spec.Images
 	for image, imagePullJob := range imagePullJobs {
 		if !slice.ContainsString(job.Spec.Images, image, nil) {
@@ -332,7 +359,7 @@ func (r *ReconcileImageListPullJob) syncImagePullJob(job *appsv1alpha1.ImageList
 	return utilerrors.NewAggregate(errs)
 }
 
-func (r *ReconcileImageListPullJob) filterImagesAndImagePullJobs(job *appsv1alpha1.ImageListPullJob, imagePullJobs map[string]*appsv1alpha1.ImagePullJob) ([]string, []*appsv1alpha1.ImagePullJob) {
+func (r *ReconcileImageListPullJob) filterImagesAndImagePullJobs(job *appsv1alpha1.ImageListPullJob, imagePullJobs map[string]*appsv1alpha1.ImagePullJob, hash string) ([]string, []*appsv1alpha1.ImagePullJob) {
 	var images, imagesInCurrentImagePullJob []string
 	var needToDelete []*appsv1alpha1.ImagePullJob
 
@@ -349,11 +376,11 @@ func (r *ReconcileImageListPullJob) filterImagesAndImagePullJobs(job *appsv1alph
 		}
 		imagePullJob, ok := imagePullJobs[image]
 		if !ok {
-			klog.Warningf("can not found imagePullJob for image name %s", image)
+			klog.InfoS("Could not found imagePullJob for image name", "imageName", image)
 			continue
 		}
 		// should create new imagePullJob if the template is changed.
-		if imagePullJobSpecTemplateChanged(imagePullJob, job.Spec.ImagePullJobTemplate) {
+		if !isConsistentVersion(imagePullJob, &job.Spec.ImagePullJobTemplate, hash) {
 			images = append(images, image)
 			// should delete old imagepulljob
 			needToDelete = append(needToDelete, imagePullJob)
@@ -363,7 +390,7 @@ func (r *ReconcileImageListPullJob) filterImagesAndImagePullJobs(job *appsv1alph
 	return images, needToDelete
 }
 
-func (r *ReconcileImageListPullJob) newImagePullJobs(job *appsv1alpha1.ImageListPullJob, images []string) []*appsv1alpha1.ImagePullJob {
+func (r *ReconcileImageListPullJob) newImagePullJobs(job *appsv1alpha1.ImageListPullJob, images []string, hash string) []*appsv1alpha1.ImagePullJob {
 	var needToCreate []*appsv1alpha1.ImagePullJob
 	if len(images) <= 0 {
 		return needToCreate
@@ -373,8 +400,10 @@ func (r *ReconcileImageListPullJob) newImagePullJobs(job *appsv1alpha1.ImageList
 			ObjectMeta: metav1.ObjectMeta{
 				Namespace:    job.Namespace,
 				GenerateName: fmt.Sprintf("%s-", job.Name),
-				Labels:       make(map[string]string),
-				Annotations:  make(map[string]string),
+				Labels: map[string]string{
+					appsv1.ControllerRevisionHashLabelKey: hash,
+				},
+				Annotations: make(map[string]string),
 				OwnerReferences: []metav1.OwnerReference{
 					*metav1.NewControllerRef(job, controllerKind),
 				},
@@ -411,10 +440,15 @@ func (r *ReconcileImageListPullJob) getOwnedImagePullJob(job *appsv1alpha1.Image
 	return imagePullJobsMap, nil
 }
 
-func imagePullJobSpecTemplateChanged(oldImagePullJob *appsv1alpha1.ImagePullJob, newImagePullJobTemplate appsv1alpha1.ImagePullJobTemplate) bool {
-	if !reflect.DeepEqual(oldImagePullJob.Spec.ImagePullJobTemplate, newImagePullJobTemplate) {
-		klog.V(3).Infof("imagePullJob(%s/%s) specification changed", oldImagePullJob.Namespace, oldImagePullJob.Name)
+func isConsistentVersion(oldImagePullJob *appsv1alpha1.ImagePullJob, newTemplate *appsv1alpha1.ImagePullJobTemplate, hash string) bool {
+	oldHash, exists := oldImagePullJob.Labels[appsv1.ControllerRevisionHashLabelKey]
+	if oldHash == hash {
 		return true
 	}
+	if !exists && reflect.DeepEqual(oldImagePullJob.Spec.ImagePullJobTemplate, *newTemplate) {
+		return true
+	}
+
+	klog.V(4).InfoS("ImagePullJob specification changed", "imagePullJob", klog.KObj(oldImagePullJob))
 	return false
 }

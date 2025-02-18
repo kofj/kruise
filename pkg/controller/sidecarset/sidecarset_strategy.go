@@ -53,7 +53,7 @@ func (p *spreadingStrategy) GetNextUpgradePods(control sidecarcontrol.SidecarCon
 		// if selector failed, always return false
 		selector, err := util.ValidatedLabelSelectorAsSelector(strategy.Selector)
 		if err != nil {
-			klog.Errorf("sidecarSet(%s) rolling selector error, err: %v", sidecarset.Name, err)
+			klog.ErrorS(err, "SidecarSet rolling selector error", "sidecarSet", klog.KObj(sidecarset))
 			return false
 		}
 		//matched
@@ -72,16 +72,18 @@ func (p *spreadingStrategy) GetNextUpgradePods(control sidecarcontrol.SidecarCon
 	for index, pod := range pods {
 		isUpdated := sidecarcontrol.IsPodSidecarUpdated(sidecarset, pod)
 		if !isUpdated && isSelected(pod) {
-			if control.IsSidecarSetUpgradable(pod) {
+			canUpgrade, consistent := control.IsSidecarSetUpgradable(pod)
+			if canUpgrade && consistent {
 				waitUpgradedIndexes = append(waitUpgradedIndexes, index)
-			} else if sidecarcontrol.GetPodSidecarSetWithoutImageRevision(sidecarset.Name, pod) != sidecarcontrol.GetSidecarSetWithoutImageRevision(sidecarset) {
+			} else if !canUpgrade {
 				// only image field can be in-place updated, if other fields changed, mark pod as not upgradable
 				notUpgradableIndexes = append(notUpgradableIndexes, index)
 			}
 		}
 	}
 
-	klog.V(3).Infof("sidecarSet(%s) matchedPods(%d) waitUpdated(%d) notUpgradable(%d)", sidecarset.Name, len(pods), len(waitUpgradedIndexes), len(notUpgradableIndexes))
+	klog.V(3).InfoS("SidecarSet's pods status", "sidecarSet", klog.KObj(sidecarset), "matchedPods", len(pods),
+		"waitUpdated", len(waitUpgradedIndexes), "notUpgradable", len(notUpgradableIndexes))
 	//2. sort Pods with default sequence and scatter
 	waitUpgradedIndexes = SortUpdateIndexes(strategy, pods, waitUpgradedIndexes)
 
@@ -137,7 +139,8 @@ func calculateUpgradeCount(coreControl sidecarcontrol.SidecarControl, waitUpdate
 	// default partition = 0, indicates all pods will been upgraded
 	var partition int
 	if strategy.Partition != nil {
-		partition, _ = intstrutil.GetValueFromIntOrPercent(strategy.Partition, totalReplicas, false)
+		totalInt32 := int32(totalReplicas)
+		partition, _ = util.CalculatePartitionReplicas(strategy.Partition, &totalInt32)
 	}
 	// indicates the partition pods will not be upgraded for the time
 	if len(waitUpdateIndexes)-partition <= 0 {
@@ -148,7 +151,7 @@ func calculateUpgradeCount(coreControl sidecarcontrol.SidecarControl, waitUpdate
 	// max unavailable pods number, default is 1
 	maxUnavailable := 1
 	if strategy.MaxUnavailable != nil {
-		maxUnavailable, _ = intstrutil.GetValueFromIntOrPercent(strategy.MaxUnavailable, totalReplicas, false)
+		maxUnavailable, _ = intstrutil.GetValueFromIntOrPercent(strategy.MaxUnavailable, totalReplicas, true)
 	}
 
 	var upgradeAndNotReadyCount int

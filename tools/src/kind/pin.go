@@ -17,4 +17,4 @@
 
 package ignore
 
-import "sigs.k8s.io/kind"
+import _ "sigs.k8s.io/kind"

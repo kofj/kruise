@@ -24,6 +24,9 @@ import (
 	"sync"
 	"testing"
 
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
+
 	"github.com/onsi/gomega"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -49,7 +52,7 @@ func TestMain(m *testing.M) {
 	t := &envtest.Environment{
 		CRDDirectoryPaths: []string{filepath.Join("..", "..", "..", "config", "crd", "bases")},
 	}
-	apis.AddToScheme(clientgoscheme.Scheme)
+	utilruntime.Must(apis.AddToScheme(clientgoscheme.Scheme))
 
 	var err error
 	if cfg, err = t.Start(); err != nil {
@@ -170,7 +173,7 @@ func TestAll(t *testing.T) {
 	g := gomega.NewGomegaWithT(t)
 
 	var err error
-	mgr, err := manager.New(cfg, manager.Options{MetricsBindAddress: "0"})
+	mgr, err := manager.New(cfg, manager.Options{Metrics: metricsserver.Options{BindAddress: "0"}})
 	g.Expect(err).NotTo(gomega.HaveOccurred())
 	_ = fieldindex.RegisterFieldIndexes(mgr.GetCache())
 	c = utilclient.NewClientFromManager(mgr, "test-nodeimage-utils")
